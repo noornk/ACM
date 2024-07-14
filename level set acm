@@ -6,7 +6,7 @@ from glob import glob
 
 
 class ActiveContourModel:
-    def __init__(self, img_paths, all_mask_paths, seg_paths, iter_limit=600, mu=0.2, nu=5.0, fast_lookup=True):
+    def __init__(self, img_paths, all_mask_paths, seg_paths, iter_limit=600, mu=0.2, nu=5.0, fast_lookup=True, narrow_band_width = 3):
         self.img_paths = img_paths
         self.all_mask_paths = all_mask_paths
         self.seg_paths = seg_paths
@@ -14,6 +14,8 @@ class ActiveContourModel:
         self.mu = mu
         self.nu = nu
         self.fast_lookup = fast_lookup
+        self.narrow_band_width = narrow_band_width
+        self.f_size = 15
 
     def load_image(self, path, batch_size, label=False):
         if path.endswith('npy'):
@@ -152,7 +154,7 @@ class ActiveContourModel:
         zero_tensor = torch.tensor(0, dtype=torch.int32)
         
         def _body(i, phi_level):
-            band_index = torch.logical_and(phi_level <= narrow_band_width, phi_level >= -narrow_band_width)
+            band_index = torch.logical_and(phi_level <= self.narrow_band_width, phi_level >= -self.narrow_band_width)
             band = torch.nonzero(band_index, as_tuple=False)
             band_y = band[:, 0]
             band_x = band[:, 1]
@@ -196,14 +198,14 @@ class ActiveContourModel:
     
                 return j + 1, mean_intensities_outer, mean_intensities_inner
             
-            if fast_lookup:
+            if self.fast_lookup:
                 phi_4d = phi_level.unsqueeze(0).unsqueeze(-1)
                 phi_4d = phi_level.unsqueeze(0).unsqueeze(-1)
                 image = img.unsqueeze(-1)
-                band_index_2 = torch.logical_and(phi_4d <= narrow_band_width, phi_4d >= -narrow_band_width)
+                band_index_2 = torch.logical_and(phi_4d <= self.narrow_band_width, phi_4d >= -self.narrow_band_width)
                 band_2 = torch.nonzero(band_index_2, as_tuple=False)
-                u_inner = get_intensity(image, (phi_4d <= 0).float()[0], filter_patch_size=f_size)
-                u_outer = get_intensity(image, ((phi_4d > 0)).float()[0], filter_patch_size=f_size)
+                u_inner = self.get_intensity(image, (phi_4d <= 0).float()[0], filter_patch_size=self.f_size)
+                u_outer = self.get_intensity(image, ((phi_4d > 0)).float()[0], filter_patch_size=self.f_size)
                 mean_intensities_inner = torch.index_select(u_inner, dim=0, index=band_2[:][0])
                 mean_intensities_outer = torch.index_select(u_outer, dim=0, index=band_2[:][0])
                 
@@ -217,19 +219,19 @@ class ActiveContourModel:
     
             lambda1 = map_lambda1_acl[:, band[:, 0], band[:, 1]]
             lambda2 = map_lambda2_acl[:, band[:, 0], band[:, 1]]
-            curvature, mean_grad = get_curvature(phi_level, band_x, band_y)  # Implement get_curvature function
+            curvature, mean_grad = self.get_curvature(phi_level, band_x, band_y)  # Implement get_curvature function
             kappa = curvature * mean_grad
             term1 = lambda1 * (img[band[:, 0], band[:, 1]] - mean_intensities_inner)**2
             term2 = lambda2 * (img[band[:, 0], band[:, 1]] - mean_intensities_inner)**2
             
-            force = -nu + term1 - term2
+            force = -self.nu + term1 - term2
             force /= torch.max(torch.abs(force)) + 2.220446049250313e-16
-            d_phi_dt = force.float() + mu * kappa
+            d_phi_dt = force.float() + self.mu * kappa
             dt = 0.45 / (torch.max(torch.abs(d_phi_dt)) + 2.220446049250313e-16)
             d_phi = dt * d_phi_dt
             update_narrow_band = d_phi
             phi_level += torch.scatter(torch.zeros_like(phi_level), 0, band.repeat(0, 1), update_narrow_band.unsqueeze(1)).squeeze(1)
-            phi_level = re_init_phi(phi_level, 0.5)  # Implement re_init_phi function
+            phi_level = self.re_init_phi(phi_level, 0.5)  # Implement re_init_phi function
     
             return (i + 1, phi_level)
         i = torch.tensor(0, dtype=torch.int32)
@@ -292,5 +294,5 @@ img_paths.sort()
 all_mask_paths.sort()
 seg_paths.sort()
 
-model = ActiveContourModel(img_paths, all_mask_paths, seg_paths)
+model = ActiveContourModel(img_paths, all_mask_paths, seg_paths, iter_limit=600, mu=0.2, nu=5.0, fast_lookup=True, narrow_band_width = 3)
 model.process_images()

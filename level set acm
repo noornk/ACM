@@ -3,7 +3,6 @@ import torch
 import torch.nn.functional as F
 from scipy.ndimage import distance_transform_edt
 from glob import glob
-from utils import load_image, re_init_phi, get_curvature, get_intensity
 
 
 class ActiveContourModel:
@@ -15,6 +14,23 @@ class ActiveContourModel:
         self.mu = mu
         self.nu = nu
         self.fast_lookup = fast_lookup
+
+    def load_image(self, path, batch_size, label=False):
+        if path.endswith('npy'):
+            image = np.load(path)
+        elif path.endswith('gif'):
+            image = Image.open(path)
+            image = np.asarray(image)
+        elif path.endswith('tif'):
+            image = Image.open(path)
+            image = np.asarray(image)
+        else: 
+            image = cv2.imread(path, 0)
+        image = image.astype('float32')
+        if label:
+            image *= 1.0 / image.max()
+        image = np.asarray([image] * batch_size)
+        return image
 
     def re_init_phi(self, phi, dt):
         D_left_shift = torch.roll(phi, shifts=(-1,), dims=(1,))

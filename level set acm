@@ -1,0 +1,280 @@
+import numpy as np
+import torch
+import torch.nn.functional as F
+from scipy.ndimage import distance_transform_edt
+from glob import glob
+from utils import load_image, re_init_phi, get_curvature, get_intensity
+
+
+class ActiveContourModel:
+    def __init__(self, img_paths, all_mask_paths, seg_paths, iter_limit=600, mu=0.2, nu=5.0, fast_lookup=True):
+        self.img_paths = img_paths
+        self.all_mask_paths = all_mask_paths
+        self.seg_paths = seg_paths
+        self.iter_limit = iter_limit
+        self.mu = mu
+        self.nu = nu
+        self.fast_lookup = fast_lookup
+
+    def re_init_phi(self, phi, dt):
+        D_left_shift = torch.roll(phi, shifts=(-1,), dims=(1,))
+        D_right_shift = torch.roll(phi, shifts=(1,), dims=(1,))
+        D_up_shift = torch.roll(phi, shifts=(-1,), dims=(0,))
+        D_down_shift = torch.roll(phi, shifts=(1,), dims=(0,))
+        
+        bp = D_left_shift - phi
+        cp = phi - D_down_shift
+        dp = D_up_shift - phi
+        ap = phi - D_right_shift
+        
+        ap = torch.clamp(ap, min=0, max=1e38)
+        bp = torch.clamp(bp, min=0, max=1e38)
+        cp = torch.clamp(cp, min=0, max=1e38)
+        dp = torch.clamp(dp, min=0, max=1e38)
+        
+        an = torch.clamp(ap, min=-1e38, max=0)
+        bn = torch.clamp(bp, min=-1e38, max=0)
+        cn = torch.clamp(cp, min=-1e38, max=0)
+        dn = torch.clamp(dp, min=-1e38, max=0)
+        
+        area_pos = torch.where(phi > 0)
+        area_neg = torch.where(phi < 0)
+        
+        pos_y = area_pos[0]
+        pos_x = area_pos[1]
+        neg_y = area_neg[0]
+        neg_x = area_neg[1]
+        
+        tmp1 = torch.max(torch.stack([torch.square(ap[pos_y, pos_x]), torch.square(bn[pos_y, pos_x])]), dim=0)[0]
+        tmp1 += torch.max(torch.stack([torch.square(cp[pos_y, pos_x]), torch.square(dn[pos_y, pos_x])]), dim=0)[0]
+        update1 = torch.sqrt(torch.abs(tmp1)) - 1
+        
+        tmp2 = torch.max(torch.stack([torch.square(an[neg_y, neg_x]), torch.square(bp[neg_y, neg_x])]), dim=0)[0]
+        tmp2 += torch.max(torch.stack([torch.square(cn[neg_y, neg_x]), torch.square(dp[neg_y, neg_x])]), dim=0)[0]
+        update2 = torch.sqrt(torch.abs(tmp2)) - 1
+        
+        indices1 = torch.stack([pos_y, pos_x], dim=1)
+        indices2 = torch.stack([neg_y, neg_x], dim=1)
+        indices_final = torch.cat([indices1, indices2], dim=0)
+        update_final = torch.cat([update1, update2], dim=0)
+        
+        dD = torch.sparse_coo_tensor(indices_final.t(), update_final, size=phi.shape, device=phi.device)
+        
+        S = phi / (torch.square(phi) + 1)
+        phi = phi - dt * S * dD.to_dense()
+        
+        return phi
+
+    def get_curvature(self, phi, x, y):
+        phi_shape = phi.shape
+        dim_x = phi_shape[1]
+        dim_y = phi_shape[0]
+        x = x.int()
+        y = y.int()
+        y_plus = (y + 1).clamp(0, dim_y - 1).long()
+        y_minus = (y - 1).clamp(0).long()
+        x_plus = (x + 1).clamp(0, dim_x - 1).long()
+        x_minus = (x - 1).clamp(0).long()
+    
+        gather_indices1 = torch.stack([y, x_plus], dim=1)  # Stack indices along dim=1
+        gather_indices2 = torch.stack([y, x_minus], dim=1)  # Stack indices along dim=1
+        d_phi_dx = phi[gather_indices1[:, 0], gather_indices1[:, 1]] - phi[gather_indices2[:, 0], gather_indices2[:, 1]]
+    
+        d_phi_dx_2 = d_phi_dx ** 2
+        
+        gather_indices1 = torch.stack([y_plus, x], dim=1)  # Stack indices along dim=1
+        gather_indices2 = torch.stack([y_minus, x], dim=1)  # Stack indices along dim=1
+        d_phi_dy = phi[gather_indices1[:, 0], gather_indices1[:, 1]] - phi[gather_indices2[:, 0], gather_indices2[:, 1]]
+    
+        d_phi_dy_2 = d_phi_dy ** 2
+        
+        gather_indices1 = torch.stack([y, x_plus], dim=1)  # Stack indices along dim=1
+        gather_indices2 = torch.stack([y, x_minus], dim=1)  # Stack indices along dim=1
+        d_phi_dxx = phi[gather_indices1[:, 0], gather_indices1[:, 1]] - phi[gather_indices2[:, 0], gather_indices2[:, 1]]
+    
+        gather_indices1 = torch.stack([y_plus, x], dim=1)  # Stack indices along dim=1
+        gather_indices2 = torch.stack([y_minus, x], dim=1)  # Stack indices along dim=1
+        d_phi_dyy = phi[gather_indices1[:, 0], gather_indices1[:, 1]] - phi[gather_indices2[:, 0], gather_indices2[:, 1]]
+    
+        gather_indices1 = torch.stack([y_minus, x_minus], dim=1)  # Stack indices along dim=1
+        gather_indices2 = torch.stack([y_plus, x_plus], dim=1)  # Stack indices along dim=1
+        gather_indices3 = torch.stack([y_minus, x_plus], dim=1)  # Stack indices along dim=1
+        gather_indices4 = torch.stack([y_plus, x_minus], dim=1)  # Stack indices along dim=1
+        d_phi_dxy = 0.25 *( - phi[gather_indices1[:, 0], gather_indices1[:, 1]] - phi[gather_indices2[:, 0], gather_indices2[:, 1]] + phi[gather_indices3[:, 0], gather_indices3[:, 1]] - phi[gather_indices4[:, 0], gather_indices4[:, 1]])
+    
+        
+        tmp_1 = d_phi_dx_2 * d_phi_dyy + d_phi_dy_2 * d_phi_dxx - 2 * d_phi_dx * d_phi_dy * d_phi_dxy
+        tmp_2 = (d_phi_dx_2 + d_phi_dy_2).pow(1.5) + 2.220446049250313e-16
+        tmp_3 = (d_phi_dx_2 + d_phi_dy_2).sqrt()
+        tmp_4 = tmp_1 / tmp_2
+        
+        curvature = tmp_3 * tmp_4
+        mean_grad = (d_phi_dx_2 + d_phi_dy_2).sqrt()
+        
+        return curvature, mean_grad
+
+    def get_intensity(self, image, masked_phi, filter_patch_size=5):
+        uu = image * masked_phi
+        u_1 = F.avg_pool2d(uu, kernel_size=filter_patch_size, stride=1, padding=filter_patch_size//2)
+        u_2 = F.avg_pool2d(masked_phi, kernel_size=filter_patch_size, stride=1, padding=filter_patch_size//2)
+        
+        u_2_prime = 1 - (u_2 > 0).float() + (u_2 < 0).float()
+        u_2 = u_2 + u_2_prime + 2.220446049250313e-16
+        
+        return u_1 / u_2
+
+    def active_contour_layer(self, elems):
+        #img = elems[0]
+        #init_phi = elems[1]
+        #map_lambda1_acl = elems[2]
+        #map_lambda2_acl = elems[3]
+        img = elems[0]    
+        init_phi = elems[1]
+        map_lambda1_acl = elems[2]
+        map_lambda2_acl = elems[3]
+        wind_coef = 3
+        zero_tensor = torch.tensor(0, dtype=torch.int32)
+        
+        def _body(i, phi_level):
+            band_index = torch.logical_and(phi_level <= narrow_band_width, phi_level >= -narrow_band_width)
+            band = torch.nonzero(band_index, as_tuple=False)
+            band_y = band[:, 0]
+            band_x = band[:, 1]
+            num_band_pixel = band.shape[0]
+    
+            window_radii_x = torch.ones(num_band_pixel) * wind_coef
+            window_radii_y = torch.ones(num_band_pixel) * wind_coef
+    
+            def body_intensity(j, mean_intensities_outer, mean_intensities_inner):
+                xnew = float(band_x[j])
+                ynew = float(band_y[j])
+                window_radius_x = float(window_radii_x[j])
+                window_radius_y = float(window_radii_y[j])
+    
+                local_window_x_min = int(torch.floor(xnew - window_radius_x))
+                local_window_x_max = int(torch.floor(xnew + window_radius_x))
+                local_window_y_min = int(torch.floor(ynew - window_radius_y))
+                local_window_y_max = int(torch.floor(ynew + window_radius_y))
+    
+                local_window_x_min = max(zero_tensor, local_window_x_min)
+                local_window_y_min = max(zero_tensor, local_window_y_min)
+                local_window_x_max = min(image_shape2 - 1, local_window_x_max)
+                local_window_y_max = min(image_shape1 - 1, local_window_y_max)
+    
+                local_image = img[:, local_window_y_min: local_window_y_max + 1, local_window_x_min: local_window_x_max + 1]
+                local_phi = phi_level[local_window_y_min: local_window_y_max + 1, local_window_x_min: local_window_x_max + 1]
+    
+                inner = torch.nonzero(local_phi <= 0, as_tuple=False)
+                area_inner = float(inner.shape[0])
+                outer = torch.nonzero(local_phi > 0, as_tuple=False)
+                area_outer = float(outer.shape[0])
+    
+                image_loc_inner = local_image[:, inner[:, 0], inner[:, 1]]
+                image_loc_outer = local_image[:, outer[:, 0], outer[:, 1]]
+    
+                mean_intensity_inner = torch.sum(image_loc_inner) / area_inner
+                mean_intensity_outer = torch.sum(image_loc_outer) / area_outer
+    
+                mean_intensities_inner = torch.cat([mean_intensities_inner[:j], mean_intensity_inner.view(1)])
+                mean_intensities_outer = torch.cat([mean_intensities_outer[:j], mean_intensity_outer.view(1)])
+    
+                return j + 1, mean_intensities_outer, mean_intensities_inner
+            
+            if fast_lookup:
+                phi_4d = phi_level.unsqueeze(0).unsqueeze(-1)
+                phi_4d = phi_level.unsqueeze(0).unsqueeze(-1)
+                image = img.unsqueeze(-1)
+                band_index_2 = torch.logical_and(phi_4d <= narrow_band_width, phi_4d >= -narrow_band_width)
+                band_2 = torch.nonzero(band_index_2, as_tuple=False)
+                u_inner = get_intensity(image, (phi_4d <= 0).float()[0], filter_patch_size=f_size)
+                u_outer = get_intensity(image, ((phi_4d > 0)).float()[0], filter_patch_size=f_size)
+                mean_intensities_inner = torch.index_select(u_inner, dim=0, index=band_2[:][0])
+                mean_intensities_outer = torch.index_select(u_outer, dim=0, index=band_2[:][0])
+                
+            else:
+                mean_intensities_inner = torch.zeros(1, dtype=torch.float32)
+                mean_intensities_outer = torch.zeros(1, dtype=torch.float32)
+                j = torch.tensor(0, dtype=torch.int32)
+                while j < num_band_pixel:
+                    j, mean_intensities_outer, mean_intensities_inner = body_intensity(j, mean_intensities_outer, mean_intensities_inner)
+                    j += 1
+    
+            lambda1 = map_lambda1_acl[:, band[:, 0], band[:, 1]]
+            lambda2 = map_lambda2_acl[:, band[:, 0], band[:, 1]]
+            curvature, mean_grad = get_curvature(phi_level, band_x, band_y)  # Implement get_curvature function
+            kappa = curvature * mean_grad
+            term1 = lambda1 * (img[band[:, 0], band[:, 1]] - mean_intensities_inner)**2
+            term2 = lambda2 * (img[band[:, 0], band[:, 1]] - mean_intensities_inner)**2
+            
+            force = -nu + term1 - term2
+            force /= torch.max(torch.abs(force)) + 2.220446049250313e-16
+            d_phi_dt = force.float() + mu * kappa
+            dt = 0.45 / (torch.max(torch.abs(d_phi_dt)) + 2.220446049250313e-16)
+            d_phi = dt * d_phi_dt
+            update_narrow_band = d_phi
+            phi_level += torch.scatter(torch.zeros_like(phi_level), 0, band.repeat(0, 1), update_narrow_band.unsqueeze(1)).squeeze(1)
+            phi_level = re_init_phi(phi_level, 0.5)  # Implement re_init_phi function
+    
+            return (i + 1, phi_level)
+        i = torch.tensor(0, dtype=torch.int32)
+        phi = init_phi
+        while i < iter_limit:
+            i, phi = _body(i, phi)
+    
+        phi = torch.round(1 - torch.sigmoid(phi)).float()
+    
+        return phi
+
+    def process_images(self):
+        for i in range(len(self.img_paths)):
+            print('Processing Case {} '.format(i + 1), self.img_paths[i], self.iter_limit)
+            id = self.img_paths[i].split('.')[0]
+            labels = load_image(self.all_mask_paths[i], 1, True)
+            image = load_image(self.img_paths[i], 1, False)[:, :, :, 0]
+            image = torch.from_numpy(image / image.max())
+            image_shape1 = image.shape[1]
+            image_shape2 = image.shape[2]
+            out_seg = torch.from_numpy(load_image(self.seg_paths[i], 1, False))
+            gt_mask = labels
+
+            x_acm = image.squeeze(0)
+            map_lambda1 = torch.exp((2.0 - out_seg) / (1.0 + out_seg))
+            map_lambda2 = torch.exp((1.0 + out_seg) / (2.0 - out_seg))
+
+            rounded_seg_acl = torch.round(out_seg)
+
+            def my_func(mask):
+                epsilon = 0
+
+                def bwdist(im): return distance_transform_edt(np.logical_not(im))
+
+                bw = mask
+                signed_dist = bwdist(bw) - bwdist(1 - bw)
+                d = signed_dist.astype(np.float32)
+                d += epsilon
+                while np.count_nonzero(d < 0) < 5:
+                    d -= 1
+
+                return d
+
+            dt_trans = torch.from_numpy(my_func(rounded_seg_acl.numpy())).float()
+            batch_size, image_shape1, image_shape2 = dt_trans.shape
+            dt_trans = dt_trans.squeeze(0)
+            seg_out_acm = self.active_contour_layer([x_acm, dt_trans, map_lambda1, map_lambda2])
+
+
+# Example usage:
+all_path_input = "/workspace/training/test/images/*.tif"
+all_path_mask = "/workspace/training/test/mask/*.gif"
+all_path_seg = "/workspace/training/test/sam/*_raw.npy"
+
+img_paths = glob(all_path_input)
+all_mask_paths = glob(all_path_mask)
+seg_paths = glob(all_path_seg)
+
+img_paths.sort()
+all_mask_paths.sort()
+seg_paths.sort()
+
+model = ActiveContourModel(img_paths, all_mask_paths, seg_paths)
+model.process_images()

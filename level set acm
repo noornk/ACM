@@ -245,12 +245,12 @@ class ActiveContourModel:
         for i in range(len(self.img_paths)):
             print('Processing Case {} '.format(i + 1), self.img_paths[i], self.iter_limit)
             id = self.img_paths[i].split('.')[0]
-            labels = load_image(self.all_mask_paths[i], 1, True)
-            image = load_image(self.img_paths[i], 1, False)[:, :, :, 0]
+            labels = self.load_image(self.all_mask_paths[i], 1, True)
+            image = self.load_image(self.img_paths[i], 1, False)[:, :, :, 0]
             image = torch.from_numpy(image / image.max())
             image_shape1 = image.shape[1]
             image_shape2 = image.shape[2]
-            out_seg = torch.from_numpy(load_image(self.seg_paths[i], 1, False))
+            out_seg = torch.from_numpy(self.load_image(self.seg_paths[i], 1, False))
             gt_mask = labels
 
             x_acm = image.squeeze(0)

@@ -155,6 +155,42 @@ class ActiveContourModel:
 
                 return j + 1, mean_intensities_outer, mean_intensities_inner
 
+            if fast_lookup:
+                phi_4d = phi_level[tf.newaxis, :, :, tf.newaxis]
+                image = img[tf.newaxis, :, :, tf.newaxis]
+                band_index_2 = tf.reduce_all([phi_4d <= narrow_band_width, phi_4d >= -narrow_band_width], axis=0)
+                band_2 = tf.where(band_index_2)
+                u_inner = get_intensity(image, tf.cast((([phi_4d <= 0])), dtype='float32')[0], filter_patch_size=f_size)
+                u_outer = get_intensity(image, tf.cast((([phi_4d > 0])), dtype='float32')[0], filter_patch_size=f_size)
+                mean_intensities_inner = tf.gather_nd(u_inner, band_2)
+                mean_intensities_outer = tf.gather_nd(u_outer, band_2)
+
+            else:
+                mean_intensities_inner = tf.constant([0], dtype='float32')
+                mean_intensities_outer = tf.constant([0], dtype='float32')
+                j = tf.constant(0, dtype=tf.int32) 
+                _, mean_intensities_outer, mean_intensities_inner = tf.while_loop(
+                    lambda j, mean_intensities_outer, mean_intensities_inner:
+                    j < num_band_pixel, body_intensity, loop_vars=[j, mean_intensities_outer, mean_intensities_inner],
+                    shape_invariants=[j.get_shape(), tf.TensorShape([None]), tf.TensorShape([None])])
+
+            lambda1 = tf.gather_nd(map_lambda1_acl, [band])
+            lambda2 = tf.gather_nd(map_lambda2_acl, [band])
+            curvature, mean_grad = get_curvature(phi_level, band_x, band_y)
+            kappa = tf.multiply(curvature, mean_grad)
+            term1 = tf.multiply(tf.cast(lambda1, dtype='float32'),tf.square(tf.gather_nd(img, [band]) - mean_intensities_inner))
+            term2 = tf.multiply(tf.cast(lambda2, dtype='float32'),tf.square(tf.gather_nd(img, [band]) - mean_intensities_outer))
+            force = -nu + term1 - 10*term2
+            force /= (tf.reduce_max(tf.abs(force)))
+            d_phi_dt = tf.cast(force, dtype="float32") + tf.cast(mu * kappa, dtype="float32")
+            dt = .45 / (tf.reduce_max(tf.abs(d_phi_dt)) + 2.220446049250313e-16)
+            d_phi = dt * d_phi_dt
+            update_narrow_band = d_phi
+            phi_level = phi_level + tf.scatter_nd([band], tf.cast(update_narrow_band, dtype='float32'),shape=[image_shape1, image_shape2])
+            phi_level = re_init_phi(phi_level, 0.5)
+            
+            return i + 1, phi_level
+
             _, mean_intensities_outer, mean_intensities_inner = tf.while_loop(
                 lambda j, *_: j < num_band_pixel,
                 body_intensity,
@@ -167,18 +203,26 @@ class ActiveContourModel:
             phi_level = phi_level - tf.multiply(self.mu, dist_transform - (mean_inner - mean_outer))
 
             return i + 1, phi_level
+            
+        i = tf.constant(0, dtype=tf.int32)
+        phi = init_phi
+        print(iter_limit, 'aaaa')
+        _, phi = tf.while_loop(lambda i, phi: i < iter_limit, _body, loop_vars=[i, phi])
+        phi = tf.round(tf.cast((1 - tf.nn.sigmoid(phi)), dtype=tf.float32))
+        
+        return phi,init_phi, map_lambda1_acl, map_lambda2_acl
 
-        _, phi_result = tf.while_loop(
-            lambda i, _: i < self.iter_limit,
-            _body,
-            [tf.constant(0), init_phi]
-        )
+        # _, phi_result = tf.while_loop(
+        #     lambda i, _: i < self.iter_limit,
+        #     _body,
+        #     [tf.constant(0), init_phi]
+        # )
 
-        return phi_result
+        # return phi_result
 
-    def train(self):
-        # Implement your training logic here
-        pass
+    # def train(self):
+    #     # Implement your training logic here
+    #     pass
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Active Contour Model Training')
@@ -189,7 +233,60 @@ def main():
     args = parse_args()
     config = read_config(args.config)
     model = ActiveContourModel(config)
-    model.train()
+    # model.train()
+    batch_size = 1
+    train_sum_freq = 150
+    img_resize = 128
+    f_size = 15
+    train_status = 1
+    narrow_band_width = 3
+    save_freq = 1000
+    demo_type = 1
+    gpu = 0
+    gpu_id = 1
+    
+    all_path_input = "/workspace/chase/image/*.jpg"
+    all_path_mask = "/workspace/chase/mask/*.png"
+    all_path_seg = "/workspace/chase/image/*_acm.npy"
+    
+    img_paths = glob(all_path_input)
+    all_mask_paths = glob(all_path_mask)
+    seg_paths = glob(all_path_seg)
+    
+    img_paths.sort()
+    all_mask_paths.sort()
+    seg_paths.sort()
+    
+    SMOOTH = 1e-6
+    mu = 0.1
+    nu = 2
+    iter_limit = 600
+    for i in range(len(img_paths)):
+        print('Processing Case {} '.format(i+1), img_paths[i], iter_limit)
+        id = img_paths[i].split('.')[0]
+        labels = load_image(all_mask_paths[i], 1, True)
+        image = load_image(img_paths[i], 1, False)
+        image = (image/image.max())
+        image_shape1 = image.shape[1]
+        image_shape2 = image.shape[2]
+        out_seg = load_image(seg_paths[i], 1, False)
+        gt_mask = labels
+    
+        x_acm = image
+        map_lambda1 = tf.exp(tf.divide(tf.subtract(2.0,out_seg),tf.add(1.0,out_seg)))
+        map_lambda2 = tf.exp(tf.divide(tf.add(1.0, out_seg), tf.subtract(2.0, out_seg)))
+        y_out_dl = tf.round(out_seg)
+        rounded_seg_acl = y_out_dl
+        dt_trans = tf.py_function(my_func, [rounded_seg_acl], tf.float32)
+        dt_trans.set_shape([batch_size, image_shape1, image_shape2])
+        seg_out_acm, _, lambda1_tr, lambda2_tr = tf.map_fn(fn=model.active_contour_layer(), elems=(x_acm, dt_trans, map_lambda1, map_lambda2))
+    
+        fig, axs = plt.subplots(1, 4, figsize=(9, 3))
+        axs[0].imshow(image[0, :, :])
+        axs[1].imshow(labels[0, :, :], cmap='gray')
+        axs[2].imshow(out_seg[0, :, :], cmap='gray')
+        axs[3].imshow(seg_out_acm[0, :, :], cmap='gray')
+        plt.show()
 
 if __name__ == '__main__':
     main()

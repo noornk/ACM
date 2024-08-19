@@ -269,7 +269,7 @@ def main():
         image = (image/image.max())
         image_shape1 = image.shape[1]
         image_shape2 = image.shape[2]
-        out_seg = load_image(seg_paths[i], 1, False)
+        out_seg = load_image(seg_paths[i], 1, True)
         gt_mask = labels
     
         x_acm = image

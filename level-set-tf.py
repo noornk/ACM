@@ -28,7 +28,10 @@ class ActiveContourModel:
 
         self.tumor_label = config['tumor_label']
         self.background_label = config['background_label']
-
+        
+    # This function draws the new contour based on the parameters derived previous to this step.
+    # It gets the previous phi (contour), and the amount of changes (dt) we want the contour to have.
+    # The output is the new phi (contour)
     def re_init_phi(self, phi, dt):
         D_left_shift = tf.cast(tf.roll(phi, -1, axis=1), dtype='float32')
         D_right_shift = tf.cast(tf.roll(phi, 1, axis=1), dtype='float32')
@@ -71,7 +74,7 @@ class ActiveContourModel:
         phi = phi - tf.multiply(dt * S, dD)
 
         return phi
-
+# This function gets phi (contour), x, andy, and calculates the curve of the contour
     def get_curvature(self, phi, x, y):
         phi_shape = tf.shape(phi)
         dim_x = phi_shape[1]
@@ -107,6 +110,7 @@ class ActiveContourModel:
 
         return curvature, mean_grad
 
+    # This function gets the images, and the contour, and calculated the intesnity of the image inside of the contour
     def get_intensity(self, image, masked_phi, filter_patch_size=5, filter_depth_size=1):
         b_exp = image
         uu = tf.multiply(b_exp, masked_phi)
@@ -118,6 +122,7 @@ class ActiveContourModel:
 
         return tf.divide(u_1, u_2)
 
+    # This function gets the image, initial contour (phi), and the mapped lambdas as input 
     def active_contour_layer(self, elems):
         img = elems[0]
         init_phi = elems[1]
@@ -154,7 +159,8 @@ class ActiveContourModel:
                 mean_intensities_inner = tf.tensor_scatter_nd_update(mean_intensities_inner, [[j]], [self.get_intensity(img, tf.gather_nd(init_phi, window_pixels))])
 
                 return j + 1, mean_intensities_outer, mean_intensities_inner
-
+# Here we have two option of calculating the contour at each iteration, either go througha fast look-up, or do the slower calculations.
+# They both have the same function, but the fast_lookup is less deatiled and computationally faster
             if fast_lookup:
                 phi_4d = phi_level[tf.newaxis, :, :, tf.newaxis]
                 image = img[tf.newaxis, :, :, tf.newaxis]
@@ -244,7 +250,7 @@ def main():
     demo_type = 1
     gpu = 0
     gpu_id = 1
-    
+    # The paths to the image, masks, and the initial contour.
     all_path_input = "/workspace/chase/image/*.jpg"
     all_path_mask = "/workspace/chase/mask/*.png"
     all_path_seg = "/workspace/chase/image/*_acm.npy"
@@ -256,7 +262,12 @@ def main():
     img_paths.sort()
     all_mask_paths.sort()
     seg_paths.sort()
-    
+    # Here we are intializing the mu, nu, and the number of iterations for the acm.
+    # mu is a parameter controlling the effect of penalizing the deviation of from a signed distance
+    # nu nfluences the smoothness term in the energy functional. This term penalizes irregularities in the contour, promoting smoother and more regular shapes
+    # iter_num is the number of iterations.
+    # Higher nu : Increases the influence of the smoothness term, leading to a smoother contour. This can help in avoiding overfitting to noise or small variations in the image but might lead to less accurate segmentation in cases where the actual contour is not smooth.
+    # Lower nu: Reduces the penalty for irregularities in the contour, allowing the contour to fit more closely to the image features. However, this may lead to less smooth contours and potential overfitting to noise or artifacts in the image.
     SMOOTH = 1e-6
     mu = 0.1
     nu = 2
